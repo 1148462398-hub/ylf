@@ -1,0 +1,85 @@
+dsh-plugin-fleet（编队）· 安装与连接指南
+========================================
+版本 1.1.0　显示名「编队」　包名 dsh-plugin-fleet
+（目录名仍然叫 dsh-fleet，不影响使用。）
+
+
+一、公司电脑装插件
+----------------
+1) 把家里电脑上这个文件夹整体拷到公司电脑（微信 / 网盘 / U 盘都行）：
+   C:\Users\123\Documents\deepseek-harness\default-workspace\dsh-fleet
+   放好后不要移动，路径要固定（插件是软链接到这里的，删了就没了）。
+
+2) 打开 DSH 网页（端口以你机器实际为准，家里这台是 http://127.0.0.1:49870）。
+
+3) 对新会话说一句：
+   「把 C:\Users\你的用户名\dsh-fleet 装成插件」
+   它会调用 plugin_manager install_bundle，返回里应该有：
+       "bundle": "dsh-plugin-fleet", "version": "1.1.0", "application": "applied"
+
+4) 左侧栏出现「编队」图标（在 Mesh 下面），点开是三栏界面。
+   没出现就 Ctrl+R 刷新一次页面。
+
+   以后改了代码要重装：先 plugin_manager remove_bundle target="dsh-plugin-fleet"，
+   再 install_bundle。直接 install 会报 already-installed，不会重新加载。
+
+
+二、两台机器配对（三种方式，可以同时生效）
+--------------------------------------
+【方式 1 · 同账号，零配置】← 最省事，推荐
+   两台机器都登录同一个 DeepSeek 账号，密钥由账号 userId 自动派生，不用做任何事。
+   机器列表里出现对方 = 已打通。
+
+【方式 2 · 面板复制密钥】
+   家里这台：编队 → 「两端密钥」→ 点「随机生成」→ 复制这一串
+   公司这台：编队 → 「两端密钥」→ 粘贴 → 点保存
+   两边显示的指纹数字一样就配对成功（家里这台当前 74bb2e9a）。
+
+【方式 3 · 配置文件写死】
+   两台机器的 cordis.patch.yml 里 config.secret 填同一个字符串（≥12 字符）。
+
+   ★ 1.1.0 起这三种不再互相顶掉：插件同一时刻认可一整组钥匙
+     （config / shared / account / account-legacy / local），逐条尝试，任意一条对上就算通。
+     所以填过共享密钥以后，同账号那条通道照样能用。
+
+【机器怎么找到对方】
+   - 同一个局域网：装了 dsh-plugin-mesh 会自动发现，列表里直接出现。
+   - 不在同一网段 / 公司网禁组播：点「手工添加机器」填对方 IP，
+     写法 192.168.1.5 或 192.168.1.5:45940
+
+
+三、怎么用
+--------
+选机器 → 中间列出它所有任务，已自动分组：
+   ▾ 工作区任务（默认展开）
+   ▸ 子智能体（默认折叠，几十上百条，点标题展开）
+   ▸ 空白会话
+   ▸ 已归档
+   每组标题后面有「N 在跑」标记；选中折叠组里的任务会自动展开该组。
+→ 点一个任务 → 右边是它的对话投影
+→ 底部输入框直接发消息，对方会接着原来的上下文继续干。
+
+
+四、注意
+--------
+- 端口 45940 别被防火墙挡；跨公网先用 Tailscale 或 cpolar 打通，再填 tailnet IP。
+- 密钥等于门钥匙，别发群里；泄露了就在面板里重新生成一次。
+- 换过 DeepSeek 账号（userId 变了）后，账号派生那把钥匙会跟着变，需要重新登录同账号或改用共享密钥。
+- 只读投影 + 发消息：不转发审批、不打断、不换模型。
+- 超长历史只回最近 400 条（truncated=true 时前端保留尾部）。
+- 自测（不需要两台机器）：
+    node _selftest-client.mjs        浏览器 bundle：插槽注册 + 首屏渲染 + 四个分组
+    node _selftest-remote.mjs        起假对端，验证投影和远程发消息
+    node _selftest-crosssecret.mjs   专门验证「填过共享密钥后同账号通道仍然可用」
+
+
+五、装不上怎么查
+--------------
+1) GET <你的DSH地址>/fleet/api/debug
+   看 version / secrets（四条指纹）/ account.userId / services 是否都在
+2) GET <你的DSH地址>/fleet/api/overview
+   看 port / secret.mode / mesh 状态 / peers
+3) GET http://<对端IP>:45940/fleet/v1/hello  带 Authorization: Bearer <密钥>
+   200 = 对端端口正常；401 = 密钥对不上；连不上 = 防火墙或地址错
+
+   把报错发我就行。

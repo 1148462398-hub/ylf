@@ -3,7 +3,34 @@
 // 然后通过 UI 接口 /fleet/api/peers/add 添加它，检查 overview/sessions/transcript/prompt 全部走远程分支。
 import { createServer } from "node:http";
 
-const UI = "http://127.0.0.1:27380/fleet/api";
+// 本机 web 端口每次启动都会变，所以自动探测：依次试常见端口，谁能回 /fleet/api/overview 就用谁。
+const CANDIDATE_PORTS = [
+  Number(process.env.DSH_WEB_PORT) || 0,
+  49870,
+  27380,
+  3000,
+  8080,
+  5173,
+].filter(Boolean);
+
+let UI = "";
+for (const port of CANDIDATE_PORTS) {
+  try {
+    const probe = await fetch(`http://127.0.0.1:${port}/fleet/api/overview`, { signal: AbortSignal.timeout(1500) });
+    if (probe.ok) {
+      UI = `http://127.0.0.1:${port}/fleet/api`;
+      break;
+    }
+  } catch {
+    /* 这个端口没有 DSH */
+  }
+}
+if (!UI) {
+  console.error("❌ 找不到本机 DSH web 端口。先用 DSH_WEB_PORT=xxxx 指定，或确认 DSH 正在运行。");
+  process.exit(1);
+}
+console.log(`本机 Host: ${UI}`);
+
 const FAKE_PORT = 45941;
 const FAKE_HOST = "127.0.0.2";
 

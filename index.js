@@ -27,7 +27,7 @@ export const name = "dsh-plugin-fleet";
 // 硬依赖只有 webServer：其余服务在调用时探测，缺了要给出明确提示而不是让插件起不来。
 export const inject = ["webServer"];
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 // 模块被真正重新 import 的时刻（用于判断改代码后加载器有没有重新加载）
 const MODULE_LOADED_AT = Date.now();
 const API = "/fleet/api";
@@ -209,8 +209,99 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 归档集合。
+   * sessionController.list() 的 SessionSummary 上没有 archived 字段，归档信息只存在于
+   * workspaceController.follow() 的 baseline 帧里（WorkspaceBaseline.archivedSessionIds）。
+   * follow 是流，所以这里开流→取首帧→立刻 abort，结果缓存 10 秒。
+   */
+  const archiveCache = { at: 0, ids: null, inflight: null };
+
+  async function readArchivedIds() {
+    if (archiveCache.ids && Date.now() - archiveCache.at < 10_000) return archiveCache.ids;
+    if (archiveCache.inflight) return archiveCache.inflight;
+    const wc = svc("workspaceController");
+    if (!wc || typeof wc.follow !== "function") return null;
+    archiveCache.inflight = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      timer.unref?.();
+      try {
+        for await (const frame of wc.follow(controller.signal)) {
+          const ids = frame?.type === "baseline" ? frame.value?.archivedSessionIds : frame?.archivedSessionIds;
+          if (Array.isArray(ids)) {
+            archiveCache.at = Date.now();
+            archiveCache.ids = ids.filter((id) => typeof id === "string" && id);
+            return archiveCache.ids;
+          }
+          break;
+        }
+        return null;
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+        controller.abort();
+        archiveCache.inflight = null;
+      }
+    })();
+    return archiveCache.inflight;
+  }
+
   // ── 账号身份（仅作归属标签 + 共享密钥派生依据）──
   const accountCache = { at: 0, value: null };
+
+  /**
+   * AccountView 里没有昵称，要另问一次 Platform profile。
+   * 失败、超时、未授权一律当作「没有昵称」，绝不影响账号状态判定。
+   */
+  async function readProfileName(acc) {
+    try {
+      const client = {
+        version: VERSION,
+        locale: "zh-CN",
+        timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+      };
+      const outcome = await Promise.race([
+        acc.getProfile(client),
+        new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
+      ]);
+      const detail = outcome?.value ?? outcome;
+      return deepPick(detail, [
+        "name",
+        "nickname",
+        "displayName",
+        "contact",
+        "user.name",
+        "profile.name",
+      ]);
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * AccountView 里没有 userId。真正的账号 ID 在 PlatformSession（getPlatformSession）
+   * 或 DeviceIdentity（getDeviceIdentity）里。都拿不到就返回空串——调用方会退回本机随机密钥。
+   */
+  async function readAccountUserId(acc) {
+    const tryCall = async (fn) => {
+      try {
+        if (typeof fn !== "function") return "";
+        const value = await Promise.race([
+          fn.call(acc),
+          new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
+        ]);
+        return deepPick(value, ["userId", "id", "user.userId", "identity.userId", "account.userId", "profile.id"]);
+      } catch {
+        return "";
+      }
+    };
+    const fromSession = await tryCall(acc.getPlatformSession);
+    if (fromSession) return fromSession;
+    return tryCall(acc.getDeviceIdentity);
+  }
+
   async function accountSnapshot(force = false) {
     const now = Date.now();
     if (!force && accountCache.value && now - accountCache.at < 30_000) return accountCache.value;
@@ -241,10 +332,24 @@ export function apply(ctx, config) {
           "name",
           "nickname",
         ]);
+        // AccountView = { status: "signed-out" | "credential-stored", links, attempt }
+        // 里面既没有 userId，也没有 signedIn —— 之前只认 "signed-in"，于是永远判成未登录。
+        const status = raw?.status ?? raw?.state;
         const signedIn = Boolean(
-          userId || raw?.signedIn === true || raw?.status === "signed-in" || raw?.state === "signed-in",
+          userId ||
+            raw?.signedIn === true ||
+            status === "signed-in" ||
+            status === "credential-stored" ||
+            raw?.attempt?.phase === "succeeded",
         );
-        value = { available: true, signedIn, userId, name: nick };
+        // AccountView 不含 userId，真实身份要从 getPlatformSession / getDeviceIdentity 取，
+        // 否则「同账号自动派生密钥」这条腿永远走不到。
+        let resolvedUserId = userId;
+        if (!resolvedUserId && signedIn) {
+          resolvedUserId = await readAccountUserId(acc);
+        }
+        const name = nick || (signedIn && typeof acc.getProfile === "function" ? await readProfileName(acc) : "");
+        value = { available: true, signedIn, userId: resolvedUserId, name };
       } catch (err) {
         value = { available: true, signedIn: false, userId: "", name: "", error: String(err?.message ?? err) };
       }
@@ -254,17 +359,46 @@ export function apply(ctx, config) {
     return value;
   }
 
-  /** 共享密钥：显式配置 > 面板里填的共享密钥 > 同账号派生 > 本机随机 */
-  async function currentSecret() {
-    const explicit = (config.secret || "").trim();
-    if (explicit) return { secret: explicit, mode: "config" };
-    const shared = (state.sharedSecret || "").trim();
-    if (shared) return { secret: shared, mode: "shared" };
+  const ACCOUNT_SALT = "dsh-plugin-fleet/v1/";
+  const ACCOUNT_SALT_LEGACY = "dsh-fleet/v1/";
+
+  /**
+   * 本机「认可」的全部密钥，按优先级排列。
+   *
+   * 这里不取单一值，是因为两种配对方式必须能同时生效：
+   *   1) 同账号零配置 —— 两台机器登录同一个 DeepSeek 账号，各自从 userId 派生，
+   *      谁都没填过共享密钥，也要能互通；
+   *   2) 手工配对   —— 一台机器上点了「随机生成」，另一台粘贴过来。
+   * 只留一个「当前密钥」时，一旦本机存了共享密钥，账号派生这条腿就被永久盖住，
+   * 同一个账号的另一台机器就再也连不上——这正是「同账号自动配对失效」的根因。
+   * 所以入站校验和出站探测都遍历这一整张表：任意一条能对上就算配对成功。
+   */
+  async function candidateSecrets() {
+    const list = [];
+    const push = (secret, mode) => {
+      const text = String(secret ?? "").trim();
+      if (!text) return;
+      if (list.some((item) => item.secret === text)) return;
+      list.push({ secret: text, mode });
+    };
+    push((config.secret || "").trim(), "config");
+    push(state.sharedSecret, "shared");
     const account = await accountSnapshot();
     if (account.userId) {
-      return { secret: sha256(`dsh-fleet/v1/${account.userId}`).toString("hex"), mode: "account", accountUserId: account.userId };
+      push(sha256(`${ACCOUNT_SALT}${account.userId}`).toString("hex"), "account");
+      // 老版本（插件还叫 dsh-fleet 时）用的是另一个前缀，留着兼容没升级的对端
+      push(sha256(`${ACCOUNT_SALT_LEGACY}${account.userId}`).toString("hex"), "account-legacy");
     }
-    return { secret: state.localSecret, mode: "local" };
+    push(state.localSecret, "local");
+    return list;
+  }
+
+  /** 主密钥：面板上展示、也是「我是谁」的默认答案 */
+  async function currentSecret() {
+    const list = await candidateSecrets();
+    const first = list[0] ?? { secret: state.localSecret, mode: "local" };
+    const account = await accountSnapshot();
+    return { ...first, accountUserId: account.userId || "", all: list };
   }
 
   /** 在面板里设置/清除两端共用的密钥（写进 state.json，重启后仍在） */
@@ -282,15 +416,21 @@ export function apply(ctx, config) {
     return sha256(secret).toString("hex").slice(0, 8);
   }
 
-  function authOk(req) {
+  /**
+   * 入站鉴权：对端只要能用上本机任一认可密钥，就放行。
+   * 这样「同账号派生」和「手工共享密钥」两条路同时有效，不再互相排斥。
+   */
+  async function authOk(req) {
     const header = String(req.headers["authorization"] ?? "");
     const match = /^Bearer\s+(.+)$/i.exec(header);
-    if (!match) return Promise.resolve(false);
+    if (!match) return false;
     const provided = sha256(match[1].trim());
-    return currentSecret().then(({ secret }) => {
-      const expected = sha256(secret);
-      return provided.length === expected.length && timingSafeEqual(provided, expected);
-    });
+    const list = await candidateSecrets();
+    for (const item of list) {
+      const expected = sha256(item.secret);
+      if (provided.length === expected.length && timingSafeEqual(provided, expected)) return true;
+    }
+    return false;
   }
 
   // ── 会话总览 ──
@@ -331,20 +471,39 @@ export function apply(ctx, config) {
       }
     }
 
+    // 归档集合：官方出口只有 workspaceController.follow 的 baseline 帧
+    let archivedIds = null;
+    try {
+      archivedIds = await readArchivedIds();
+    } catch (err) {
+      notes.push(`读取归档集合失败：${String(err?.message ?? err)}`);
+    }
+    if (archivedIds === null) notes.push("读不到归档集合（workspaceController 不可用），已归档会话无法单独收纳");
+    const archivedSet = new Set(archivedIds ?? []);
+
     const rows = items
       .filter((item) => typeof item?.sessionId === "string" && item.sessionId)
-      .filter((item) => !item.parentSessionId || item.origin === "subagent")
-      .map((item) => ({
-        sessionId: item.sessionId,
-        title: "",
-        running: Boolean(item.running),
-        updatedAt: Number(item.updatedAt) || 0,
-        cwd: typeof item.cwd === "string" ? item.cwd : "",
-        origin: typeof item.origin === "string" ? item.origin : "",
-        parentSessionId: typeof item.parentSessionId === "string" ? item.parentSessionId : "",
-        blank: Boolean(item.blank),
-        agentAvailable: item.agentAvailable !== false,
-      }));
+      .map((item) => {
+        const parentSessionId = typeof item.parentSessionId === "string" ? item.parentSessionId : "";
+        const origin = typeof item.origin === "string" ? item.origin : "";
+        const blank = Boolean(item.blank);
+        const archived = archivedSet.has(item.sessionId);
+        // 分组优先级：归档 > 子智能体 > 空白 > 工作区
+        const group = archived ? "archived" : origin === "subagent" || parentSessionId ? "subagent" : blank ? "blank" : "workspace";
+        return {
+          sessionId: item.sessionId,
+          title: "",
+          running: Boolean(item.running),
+          updatedAt: Number(item.updatedAt) || 0,
+          cwd: typeof item.cwd === "string" ? item.cwd : "",
+          origin,
+          parentSessionId,
+          blank,
+          archived,
+          group,
+          agentAvailable: item.agentAvailable !== false,
+        };
+      });
 
     // 标题是单独的快照读取；失败不能拖垮整个列表
     if (sq && typeof sq.readTitleSnapshots === "function" && rows.length > 0) {
@@ -648,39 +807,45 @@ export function apply(ctx, config) {
     }
 
     // 并行探活：拿到对方机器名、账号、会话数
+    // 每条地址 × 每个本地认可密钥都要试一遍——两端可能各自落在不同的配对方式上
+    // （一边是账号派生、一边是手工粘贴的共享密钥），只试主密钥会把这种组合误判成「密钥不一致」。
+    const secrets = secret.all?.length ? secret.all : [{ secret: secret.secret, mode: secret.mode }];
     await Promise.all(
       candidates.map(async (candidate) => {
         let lastError = "";
         for (const host of candidate.hosts) {
-          const url = `http://${host}:${candidate.port}${PEER}/hello`;
-          try {
-            const response = await fetch(url, {
-              headers: { authorization: `Bearer ${secret.secret}` },
-              signal: AbortSignal.timeout(8000),
-            });
-            if (response.status === 401) {
-              lastError = "共享密钥不一致";
-              break;
+          for (const item of secrets) {
+            const url = `http://${host}:${candidate.port}${PEER}/hello`;
+            try {
+              const response = await fetch(url, {
+                headers: { authorization: `Bearer ${item.secret}` },
+                signal: AbortSignal.timeout(8000),
+              });
+              if (response.status === 401) {
+                lastError = "共享密钥不一致";
+                continue;
+              }
+              if (!response.ok) {
+                lastError = `HTTP ${response.status}`;
+                continue;
+              }
+              const hello = await response.json();
+              candidate.online = true;
+              candidate.reachable = true;
+              candidate.matchedHost = host;
+              candidate.matchedSecretMode = item.mode;
+              candidate.machine = String(hello?.machine ?? candidate.machine);
+              candidate.instanceId = String(hello?.instanceId ?? candidate.instanceId);
+              candidate.version = String(hello?.version ?? "");
+              candidate.account = hello?.account ?? null;
+              candidate.sessionCount = Number(hello?.sessionCount) || 0;
+              candidate.runningCount = Number(hello?.runningCount) || 0;
+              candidate.note = candidate.self ? "本机" : "";
+              lastError = "";
+              return;
+            } catch (err) {
+              lastError = String(err?.message ?? err);
             }
-            if (!response.ok) {
-              lastError = `HTTP ${response.status}`;
-              continue;
-            }
-            const hello = await response.json();
-            candidate.online = true;
-            candidate.reachable = true;
-            candidate.matchedHost = host;
-            candidate.machine = String(hello?.machine ?? candidate.machine);
-            candidate.instanceId = String(hello?.instanceId ?? candidate.instanceId);
-            candidate.version = String(hello?.version ?? "");
-            candidate.account = hello?.account ?? null;
-            candidate.sessionCount = Number(hello?.sessionCount) || 0;
-            candidate.runningCount = Number(hello?.runningCount) || 0;
-            candidate.note = candidate.self ? "本机" : "";
-            lastError = "";
-            return;
-          } catch (err) {
-            lastError = String(err?.message ?? err);
           }
         }
         if (!candidate.self) {
@@ -698,7 +863,14 @@ export function apply(ctx, config) {
       at: Date.now(),
       self: { machine, instanceId: state.instanceId, port: config.port, hostname: hostname(), platform: platform() },
       account,
-      secret: { mode: secret.mode, fingerprint: sha256(secret.secret).toString("hex").slice(0, 8), value: secret.secret },
+      secret: {
+        mode: secret.mode,
+        fingerprint: sha256(secret.secret).toString("hex").slice(0, 8),
+        value: secret.secret,
+        // 本机同时认可的全部配对方式（同账号派生 / 手工共享密钥 / 配置手写），
+        // 面板据此提示「同账号是否已经能直连」，而不是只看主密钥那一条。
+        modes: (secret.all ?? []).map((item) => item.mode),
+      },
       mesh: { ok: mesh.ok, error: mesh.error, count: mesh.peers.length, port: config.meshPort },
       extraPeers: [...state.extraPeers],
       peers: candidates,
@@ -733,34 +905,46 @@ export function apply(ctx, config) {
     if (peer.self) return { kind: "self" };
     const host = peer.matchedHost || peer.hosts[0];
     if (!host) throw new Error(`目标机器 ${peer.machine} 没有可用地址`);
-    return { kind: "remote", peer, host, port: peer.port };
+    return { kind: "remote", peer, host, port: peer.port, secretMode: peer.matchedSecretMode ?? "" };
   }
 
   async function callRemote(host, port, path, options = {}) {
-    const { secret } = await currentSecret();
-    const url = `http://${host}:${port}${path}`;
-    const response = await fetch(url, {
-      method: options.method ?? "GET",
-      headers: {
-        authorization: `Bearer ${secret}`,
-        ...(options.body ? { "content-type": "application/json" } : {}),
-      },
-      body: options.body ? JSON.stringify(options.body) : undefined,
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
-    });
-    if (response.status === 401) {
-      throw new Error("对端拒绝访问：两端共享密钥不一致。请确认两台机器登录同一个 DeepSeek 账号，或在两端配置里写同一个 secret。");
+    const primary = await currentSecret();
+    // 先试探活时真正对上的那把钥匙，再退回其余候选
+    const ordered = [];
+    const push = (item) => {
+      if (item && !ordered.some((x) => x.secret === item.secret)) ordered.push(item);
+    };
+    if (options.secretMode) push((primary.all ?? []).find((item) => item.mode === options.secretMode));
+    push(primary);
+    for (const item of primary.all ?? []) push(item);
+
+    let lastError = null;
+    for (const item of ordered) {
+      const url = `http://${host}:${port}${path}`;
+      const response = await fetch(url, {
+        method: options.method ?? "GET",
+        headers: {
+          authorization: `Bearer ${item.secret}`,
+          ...(options.body ? { "content-type": "application/json" } : {}),
+        },
+        body: options.body ? JSON.stringify(options.body) : undefined,
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
+      });
+      if (response.status === 401) {
+        lastError = new Error("对端拒绝访问：两端共享密钥不一致。请确认两台机器登录同一个 DeepSeek 账号，或在两端配置里写同一个 secret。");
+        continue;
+      }
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      if (!response.ok) throw new Error(payload?.error ?? `对端返回 HTTP ${response.status}`);
+      return payload ?? {};
     }
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch {
-      payload = null;
-    }
-    if (!response.ok) {
-      throw new Error(payload?.error ?? `对端返回 HTTP ${response.status}`);
-    }
-    return payload ?? {};
+    throw lastError ?? new Error("对端拒绝访问");
   }
 
   // ── 对端端口 ──
@@ -790,6 +974,16 @@ export function apply(ctx, config) {
     ]);
   }
 
+  /** 按组统计，前端直接用来渲染分组标题 */
+  function groupCounts(rows) {
+    const counts = { workspace: 0, subagent: 0, blank: 0, archived: 0 };
+    for (const row of rows) {
+      const key = row.group || "workspace";
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return counts;
+  }
+
   async function peerSessions() {
     const { rows, notes } = (await listSessionsCached(0)) ?? { rows: [], notes: [] };
     return {
@@ -797,6 +991,7 @@ export function apply(ctx, config) {
       machine,
       generatedAt: Date.now(),
       sessions: rows,
+      counts: groupCounts(rows),
       notes,
       account: await accountSnapshot(),
     };
@@ -1003,7 +1198,9 @@ export function apply(ctx, config) {
         const value = await peerSessions();
         return send(res, 200, { ok: true, target: "self", ...value });
       }
-      const value = await callRemote(resolved.host, resolved.port, `${PEER}/sessions`);
+      const value = await callRemote(resolved.host, resolved.port, `${PEER}/sessions`, {
+        secretMode: resolved.secretMode,
+      });
       return send(res, 200, { ok: true, target: resolved.peer.key, machine: resolved.peer.machine, ...value });
     });
 
@@ -1023,6 +1220,7 @@ export function apply(ctx, config) {
         resolved.host,
         resolved.port,
         `${PEER}/transcript?sessionId=${encodeURIComponent(sessionId)}&afterSeq=${afterSeq}`,
+        { secretMode: resolved.secretMode },
       );
       return send(res, 200, { ...value, target: resolved.peer.key });
     });
@@ -1045,6 +1243,7 @@ export function apply(ctx, config) {
       const value = await callRemote(resolved.host, resolved.port, `${PEER}/prompt`, {
         method: "POST",
         body: { sessionId, text: body?.text, mode: body?.mode },
+        secretMode: resolved.secretMode,
       });
       return send(res, 200, { ...value, target: resolved.peer.key });
     });
@@ -1132,6 +1331,24 @@ export function apply(ctx, config) {
         out.accountError = String(err?.message ?? err);
       }
       try {
+        // 配对诊断：本机认可的每把钥匙（只报 mode + 指纹，绝不回显密钥本身）
+        const list = await candidateSecrets();
+        out.secrets = list.map((item) => ({
+          mode: item.mode,
+          fingerprint: sha256(item.secret).toString("hex").slice(0, 8),
+        }));
+        const acct = await accountSnapshot();
+        out.accountDerive = {
+          salt: ACCOUNT_SALT,
+          userId: acct.userId,
+          userIdType: typeof acct.userId,
+          joinedLength: `${ACCOUNT_SALT}${acct.userId}`.length,
+          probeFingerprint: sha256(`${ACCOUNT_SALT}${acct.userId}`).toString("hex").slice(0, 8),
+        };
+      } catch (err) {
+        out.secretsError = String(err?.message ?? err);
+      }
+      try {
         const raw = await svc("deepseekAccount")?.getState?.();
         out.accountRaw = raw === undefined ? null : JSON.parse(JSON.stringify(raw));
       } catch (err) {
@@ -1154,6 +1371,8 @@ export function apply(ctx, config) {
         const { rows, notes } = await listSessionsLocal();
         out.sessionCount = rows.length;
         out.runningCount = rows.filter((row) => row.running).length;
+        out.sessionCounts = groupCounts(rows);
+        out.archivedIds = await readArchivedIds();
         out.sessionSample = rows.slice(0, 2).map((row) => ({ id: row.sessionId, title: row.title, running: row.running }));
         out.notes = notes;
       } catch (err) {

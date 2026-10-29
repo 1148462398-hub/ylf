@@ -150,15 +150,26 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // 分组定义：顺序即渲染顺序；defaultOpen 决定初始是否展开
+    const GROUPS = [
+      { key: "workspace", label: "工作区任务", hint: "默认工作区里自己开的会话", defaultOpen: true },
+      { key: "subagent", label: "子智能体", hint: "由主会话派生出来的子任务", defaultOpen: false },
+      { key: "blank", label: "空白会话", hint: "还没开始过的空会话", defaultOpen: false },
+      { key: "archived", label: "已归档", hint: "在 DSH 里归档过的会话", defaultOpen: false },
+    ];
+
     function SessionRow(props) {
       const session = props.session;
       const active = props.active;
       const label = session.title || "（未命名会话）";
+      const tags = [];
+      if (session.archived) tags.push("已归档");
+      if (session.parentSessionId) tags.push("子任务");
       return h(
         "button",
         {
           type: "button",
-          className: `fleet-session${active ? " is-active" : ""}`,
+          className: `fleet-session${active ? " is-active" : ""}${session.archived ? " is-archived" : ""}`,
           onClick: () => props.onSelect(session.sessionId),
           title: session.cwd || session.sessionId,
         },
@@ -167,6 +178,7 @@ window.__ModuleLoader__.load({
           { className: "fleet-session-top" },
           session.running ? h("span", { className: "fleet-pulse" }) : h("span", { className: "fleet-idle" }),
           h("span", { className: "fleet-session-title" }, label),
+          tags.length ? h("span", { className: "fleet-tag is-dim" }, tags.join(" · ")) : null,
         ),
         h(
           "span",
@@ -176,6 +188,42 @@ window.__ModuleLoader__.load({
           timeAgo(session.updatedAt),
           session.cwd ? ` · ${baseName(session.cwd)}` : "",
         ),
+      );
+    }
+
+    /** 一个可折叠分组：标题 + 计数，展开后才渲染里面的会话 */
+    function GroupSection(props) {
+      const group = props.group;
+      const rows = props.rows;
+      const open = props.open;
+      const running = rows.filter((row) => row.running).length;
+      return h(
+        "div",
+        { className: `fleet-group${open ? " is-open" : ""}` },
+        h(
+          "button",
+          { type: "button", className: "fleet-group-head", onClick: () => props.onToggle(group.key) },
+          h("span", { className: "fleet-group-caret" }, open ? "▾" : "▸"),
+          h("span", { className: "fleet-group-label" }, group.label),
+          h("span", { className: "fleet-group-count" }, String(rows.length)),
+          running > 0 ? h("span", { className: "fleet-badge is-running" }, `${running} 在跑`) : null,
+        ),
+        open
+          ? h(
+              "div",
+              { className: "fleet-group-body" },
+              rows.length === 0
+                ? h("div", { className: "fleet-group-empty" }, "（空）")
+                : rows.map((session) =>
+                    h(SessionRow, {
+                      key: session.sessionId,
+                      session,
+                      active: session.sessionId === props.activeId,
+                      onSelect: props.onSelect,
+                    }),
+                  ),
+            )
+          : null,
       );
     }
 
@@ -266,6 +314,12 @@ window.__ModuleLoader__.load({
       const [peerDraft, setPeerDraft] = useState("");
       const [peerBusy, setPeerBusy] = useState(false);
       const [peerNotice, setPeerNotice] = useState("");
+      // 分组展开状态：默认只展开「工作区任务」，其余折叠（434 个会话时这是必需的）
+      const [openGroups, setOpenGroups] = useState(() => {
+        const init = {};
+        for (const group of GROUPS) init[group.key] = Boolean(group.defaultOpen);
+        return init;
+      });
 
       const cursorRef = useRef(0);
       const aliveRef = useRef(true);
@@ -501,19 +555,46 @@ window.__ModuleLoader__.load({
       const manualPeers = (overview && overview.extraPeers) || [];
       const selectedSession = sessions.find((session) => session.sessionId === sessionId) || null;
 
+      // 按组切分会话；组内保持 Host 给的 updatedAt 降序
+      const grouped = useMemo(() => {
+        const bucket = {};
+        for (const group of GROUPS) bucket[group.key] = [];
+        for (const session of sessions) {
+          const key = bucket[session.group] ? session.group : "workspace";
+          bucket[key].push(session);
+        }
+        return bucket;
+      }, [sessions]);
+
+      const toggleGroup = useCallback((key) => {
+        setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+      }, []);
+
+      // 选中的会话若落在折叠组里，自动把它展开——否则左侧看不到当前选中的那条
+      useEffect(() => {
+        if (!sessionId) return;
+        const current = sessions.find((session) => session.sessionId === sessionId);
+        if (!current || !current.group) return;
+        setOpenGroups((prev) => (prev[current.group] ? prev : { ...prev, [current.group]: true }));
+      }, [sessionId, sessions]);
+
       // 头部状态条
       const headerHints = [];
       if (accountInfo && !accountInfo.signedIn) headerHints.push("未登录 DeepSeek 账号：请用面板里的密钥配对两台机器");
       if (secretInfo) {
-        headerHints.push(
+        const modeText =
           secretInfo.mode === "account"
-            ? `密钥：账号派生（指纹 ${secretInfo.fingerprint}）`
+            ? "账号派生"
             : secretInfo.mode === "config"
-              ? `密钥：手写配置（指纹 ${secretInfo.fingerprint}）`
+              ? "手写配置"
               : secretInfo.mode === "shared"
-                ? `密钥：面板共享（指纹 ${secretInfo.fingerprint}）`
-                : `密钥：本机随机（指纹 ${secretInfo.fingerprint}）`,
-        );
+                ? "面板共享"
+                : "本机随机";
+        headerHints.push(`密钥：${modeText}（指纹 ${secretInfo.fingerprint}）`);
+        // 同账号派生这条路现在永远保留：就算本机存了共享密钥，另一台同账号机器照样能连上
+        const modes = Array.isArray(secretInfo.modes) ? secretInfo.modes : [];
+        if (modes.includes("account") && secretInfo.mode !== "account") headerHints.push("同账号直连同时可用");
+        if (!modes.includes("account") && accountInfo?.signedIn) headerHints.push("未取到账号 ID：只能靠共享密钥配对");
       }
       if (meshInfo && !meshInfo.ok) headerHints.push(`未读到 mesh（${meshInfo.error}），机器列表可能只有本机`);
 
@@ -632,7 +713,7 @@ window.__ModuleLoader__.load({
               secretInfo && secretInfo.value
                 ? h("code", { className: "fleet-secret" }, secretInfo.value)
                 : h("div", { className: "fleet-pair-hint" }, "读不到密钥值"),
-              h("div", { className: "fleet-pair-hint" }, "把这一串填到另一台机器的同一位置，两台即可互看任务、互发消息。"),
+              h("div", { className: "fleet-pair-hint" }, "同一 DeepSeek 账号的两台机器会自动互通，这一串只用于跨账号或不想依赖账号时的手工配对。"),
               h(
                 "div",
                 { className: "fleet-pair-row" },
@@ -663,11 +744,14 @@ window.__ModuleLoader__.load({
               { className: "fleet-scroll" },
               sessions.length === 0
                 ? h("div", { className: "fleet-empty" }, sessionsError ? "读不到任务列表" : "这台机器上没有会话")
-                : sessions.map((session) =>
-                    h(SessionRow, {
-                      key: session.sessionId,
-                      session,
-                      active: session.sessionId === sessionId,
+                : GROUPS.map((group) =>
+                    h(GroupSection, {
+                      key: group.key,
+                      group,
+                      rows: grouped[group.key] || [],
+                      open: Boolean(openGroups[group.key]),
+                      onToggle: toggleGroup,
+                      activeId: sessionId,
                       onSelect: setSessionId,
                     }),
                   ),
@@ -793,6 +877,23 @@ window.__ModuleLoader__.load({
 }
 .fleet-session:hover { background: var(--dsw-alias-bg-layer-1, #f5f5f5); }
 .fleet-session.is-active { background: var(--dsw-alias-bg-layer-1, #eef2ff); border-color: var(--dsw-alias-border-l2, #d8def7); }
+.fleet-session.is-archived .fleet-session-title { color: var(--dsw-alias-label-secondary, #8a8a8a); }
+.fleet-group { margin-bottom: 2px; }
+.fleet-group-head {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  padding: 5px 7px; border: 0; border-radius: 6px; cursor: pointer; font: inherit;
+  font-size: 11px; color: var(--dsw-alias-label-secondary, #6b6b6b); background: transparent;
+}
+.fleet-group-head:hover { background: var(--dsw-alias-bg-layer-1, #f5f5f5); }
+.fleet-group-caret { width: 10px; flex: 0 0 auto; opacity: .8; }
+.fleet-group-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-group-count {
+  font-size: 10px; padding: 0 5px; border-radius: 999px; flex: 0 0 auto;
+  background: var(--dsw-alias-bg-layer-2, #ececec); color: var(--dsw-alias-label-secondary, #6b6b6b);
+}
+.fleet-group-body { padding: 2px 0 4px 6px; }
+.fleet-group-empty { padding: 4px 10px 6px; font-size: 11px; color: var(--dsw-alias-label-secondary, #a3a3a3); }
+.fleet-tag.is-dim { background: transparent; color: var(--dsw-alias-label-secondary, #9a9a9a); padding: 0; font-size: 10px; flex: 0 0 auto; }
 .fleet-session-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .fleet-session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fleet-session-meta { font-size: 11px; color: var(--dsw-alias-label-secondary, #6b6b6b); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
