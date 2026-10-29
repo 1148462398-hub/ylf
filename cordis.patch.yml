@@ -1,0 +1,22 @@
+# dsh-plugin-fleet —— 把「其他电脑上的 DSH 会话」投影到这台电脑并继续发消息。
+#
+# 两侧配置对得上就能互通：
+#   · 同一个 DeepSeek 账号登录时，共享密钥由账号 ID 派生，无需手动配置；
+#   · 也可以显式写死同一个 secret（跨账号、或不想依赖账号派生时用）。
+- insert:
+    - id: fleet
+      name: dsh-plugin-fleet
+      config:
+        enabled: true
+        # 本机对端端口：别的机器的 fleet 会连这个端口。所有机器保持一致最省事。
+        port: 45940
+        # dsh-plugin-mesh 的端口，用来读它发现的机器列表（默认 45917）。
+        meshPort: 45917
+        # 留空 = 自动：登录了账号就按账号派生，否则用本机随机密钥。
+        secret: ''
+        # mesh 没装、或对方不在同一网段时，手工填对方 IP（可带 :端口，如 192.168.1.9）。
+        extraPeers: []
+        # 留空 = 用主机名
+        machineName: ''
+        # 单次对端请求超时
+        requestTimeoutMs: 12000

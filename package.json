@@ -1,0 +1,68 @@
+{
+  "name": "dsh-plugin-fleet",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Fleet: watch and drive DSH sessions running on your other machines. Lists remote sessions with live run state, projects their transcripts into this GUI, and lets you send follow-up prompts into them — paired by a shared key over LAN, mesh, or a tunnel.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "fleet",
+    "remote",
+    "mesh",
+    "session",
+    "multi-machine"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1148462398-hub/ylf.git"
+  },
+  "homepage": "https://github.com/1148462398-hub/ylf#readme",
+  "bugs": {
+    "url": "https://github.com/1148462398-hub/ylf/issues"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "dsh-plugin-mesh": ">=0.5.4"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "dsh-plugin-mesh": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
