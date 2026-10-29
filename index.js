@@ -18,7 +18,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { homedir, hostname, platform } from "node:os";
+import { homedir, hostname, networkInterfaces, platform } from "node:os";
 import { join } from "node:path";
 
 import z from "@deepseek-ai/schemastery";
@@ -27,7 +27,7 @@ export const name = "dsh-plugin-fleet";
 // 硬依赖只有 webServer：其余服务在调用时探测，缺了要给出明确提示而不是让插件起不来。
 export const inject = ["webServer"];
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 // 模块被真正重新 import 的时刻（用于判断改代码后加载器有没有重新加载）
 const MODULE_LOADED_AT = Date.now();
 const API = "/fleet/api";
@@ -46,7 +46,10 @@ export const Config = z.object({
   extraPeers: z.array(String).default([]),
   /** 留空 = 主机名 */
   machineName: z.string().default(""),
-  requestTimeoutMs: z.natural().default(12000),
+  /** 局域网请求超时 */
+  requestTimeoutMs: z.natural().default(20000),
+  /** 隧道（https）请求超时：跨公网 + 会话列表上百 KB，要放宽 */
+  tunnelTimeoutMs: z.natural().default(60000),
 });
 
 // ────────────────────────────── 小工具 ──────────────────────────────
@@ -104,12 +107,62 @@ function deepPick(obj, paths) {
   return "";
 }
 
+/**
+ * 解析一个对端地址。除了 `192.168.1.5` / `192.168.1.5:45940`，
+ * 还接受带协议的完整 URL —— 跨公网时对端往往只有一个 https 隧道域名：
+ *   https://1ae40e94.r19.vip.cpolar.cn
+ *   http://my-vps:8080
+ * 返回 { host, port, scheme }，scheme 默认 http；https 且没写端口时补 443。
+ */
 function parseTarget(text) {
-  const raw = String(text ?? "").trim();
+  let raw = String(text ?? "").trim();
+  if (!raw) return null;
+  let scheme = "http";
+  const withScheme = /^(https?):\/\/(.+)$/i.exec(raw);
+  if (withScheme) {
+    scheme = withScheme[1].toLowerCase();
+    raw = withScheme[2];
+  }
+  raw = raw.replace(/\/+$/, "");
   if (!raw) return null;
   const withPort = /^(.+?):(\d+)$/.exec(raw);
-  if (withPort) return { host: withPort[1], port: Number(withPort[2]) };
-  return { host: raw, port: null };
+  if (withPort) return { host: withPort[1], port: Number(withPort[2]), scheme };
+  return { host: raw, port: scheme === "https" ? 443 : null, scheme };
+}
+
+/** 把 { scheme, host, port } 还原成可写进配置/状态文件的地址字符串 */
+function formatTarget(parsed, defaultPort) {
+  const scheme = parsed.scheme === "https" ? "https" : "http";
+  const prefix = scheme === "https" ? "https://" : "";
+  const port = parsed.port ?? defaultPort;
+  const suffix = port === defaultPort || (scheme === "https" && port === 443) ? "" : `:${port}`;
+  return `${prefix}${parsed.host}${suffix}`;
+}
+
+/** 本机所有可用的局域网地址 —— 面板要直接告诉用户「另一台该填哪个地址」 */
+function localAddresses() {
+  const out = [];
+  try {
+    const interfaces = networkInterfaces();
+    for (const [name, list] of Object.entries(interfaces)) {
+      for (const item of list ?? []) {
+        if (item.family !== "IPv4" || item.internal) continue;
+        out.push({ name, address: item.address, netmask: item.netmask });
+      }
+    }
+  } catch {
+    /* 取不到就算了 */
+  }
+  // 169.254.x 是链路本地地址，对面填了也连不上，排到最后
+  out.sort((a, b) => Number(a.address.startsWith("169.254.")) - Number(b.address.startsWith("169.254.")));
+  return out;
+}
+
+/** 拼对端 URL。https 且端口是 443 时不写端口，隧道域名才认得。 */
+function peerUrl(scheme, host, port, path) {
+  const proto = scheme === "https" ? "https" : "http";
+  const portPart = scheme === "https" && (port === 443 || !port) ? "" : `:${port}`;
+  return `${proto}://${host}${portPart}${path}`;
 }
 
 function blocksText(content) {
@@ -434,6 +487,9 @@ export function apply(ctx, config) {
   }
 
   // ── 会话总览 ──
+  // 标题快照读一次就记住：几百条会话时重复读会持续超时，而标题本身几乎不变。
+  const titleCache = new Map();
+
   async function listSessionsLocal() {
     const sc = svc("sessionController");
     const sq = svc("sessionQuery");
@@ -505,25 +561,32 @@ export function apply(ctx, config) {
         };
       });
 
-    // 标题是单独的快照读取；失败不能拖垮整个列表
-    if (sq && typeof sq.readTitleSnapshots === "function" && rows.length > 0) {
-      try {
-        const observations = await sq.readTitleSnapshots(
-          rows.map((row) => row.sessionId),
-          AbortSignal.timeout(15_000),
-        );
-        const byId = new Map();
-        for (const observation of Array.isArray(observations) ? observations : []) {
-          if (observation?.status === "fulfilled") {
+    // 标题是单独的快照读取；失败不能拖垮整个列表。
+    // 会话多时（几百条子智能体）一次读全部会超时，所以分批 + 缓存：
+    // 已经拿到标题的会话不再重复读，每批失败只影响这一批。
+    if (sq && typeof sq.readTitleSnapshots === "function" && rows.length > 0) {      const missing = rows.filter((row) => !titleCache.has(row.sessionId)).map((row) => row.sessionId);
+      const BATCH = 60;
+      let failedBatches = 0;
+      for (let i = 0; i < missing.length; i += BATCH) {
+        const slice = missing.slice(i, i + BATCH);
+        try {
+          const observations = await sq.readTitleSnapshots(slice, AbortSignal.timeout(12_000));
+          for (const observation of Array.isArray(observations) ? observations : []) {
+            if (observation?.status !== "fulfilled") continue;
             const title = observation.value?.title?.title;
-            if (typeof title === "string" && title.trim()) byId.set(observation.sessionId, title.trim());
+            if (typeof title === "string" && title.trim()) titleCache.set(observation.sessionId, title.trim());
+            else titleCache.set(observation.sessionId, "");
           }
+        } catch {
+          failedBatches += 1;
         }
-        for (const row of rows) {
-          if (byId.has(row.sessionId)) row.title = byId.get(row.sessionId);
-        }
-      } catch (err) {
-        notes.push(`readTitleSnapshots 失败：${String(err?.message ?? err)}`);
+      }
+      for (const row of rows) {
+        const cached = titleCache.get(row.sessionId);
+        if (cached) row.title = cached;
+      }
+      if (failedBatches > 0) {
+        notes.push(`标题读取有 ${failedBatches} 批超时（共 ${Math.ceil(missing.length / BATCH)} 批），其余已缓存`);
       }
     }
 
@@ -794,15 +857,18 @@ export function apply(ctx, config) {
       const parsed = parseTarget(entry);
       if (!parsed) continue;
       if (candidates.some((item) => item.hosts.includes(parsed.host))) continue;
+      const scheme = parsed.scheme === "https" ? "https" : "http";
+      const port = parsed.port ?? config.port;
       candidates.push({
         key: `manual:${parsed.host}`,
         machine: parsed.host,
         instanceId: "",
         hosts: [parsed.host],
-        port: parsed.port ?? config.port,
+        port,
+        scheme,
         self: false,
         online: true,
-        note: "手工添加的地址",
+        note: scheme === "https" ? "手工添加的隧道地址" : "手工添加的地址",
       });
     }
 
@@ -813,13 +879,16 @@ export function apply(ctx, config) {
     await Promise.all(
       candidates.map(async (candidate) => {
         let lastError = "";
+        const scheme = candidate.scheme === "https" ? "https" : "http";
+        // 隧道走公网，握手比局域网慢，给更宽的预算
+        const probeTimeout = scheme === "https" ? 15_000 : 8_000;
         for (const host of candidate.hosts) {
           for (const item of secrets) {
-            const url = `http://${host}:${candidate.port}${PEER}/hello`;
+            const url = peerUrl(scheme, host, candidate.port, `${PEER}/hello`);
             try {
               const response = await fetch(url, {
                 headers: { authorization: `Bearer ${item.secret}` },
-                signal: AbortSignal.timeout(8000),
+                signal: AbortSignal.timeout(probeTimeout),
               });
               if (response.status === 401) {
                 lastError = "共享密钥不一致";
@@ -861,7 +930,15 @@ export function apply(ctx, config) {
 
     return {
       at: Date.now(),
-      self: { machine, instanceId: state.instanceId, port: config.port, hostname: hostname(), platform: platform() },
+      self: {
+        machine,
+        instanceId: state.instanceId,
+        port: config.port,
+        hostname: hostname(),
+        platform: platform(),
+        // 面板直接把这一行显示成「另一台机器该填的地址」
+        addresses: localAddresses(),
+      },
       account,
       secret: {
         mode: secret.mode,
@@ -905,7 +982,14 @@ export function apply(ctx, config) {
     if (peer.self) return { kind: "self" };
     const host = peer.matchedHost || peer.hosts[0];
     if (!host) throw new Error(`目标机器 ${peer.machine} 没有可用地址`);
-    return { kind: "remote", peer, host, port: peer.port, secretMode: peer.matchedSecretMode ?? "" };
+    return {
+      kind: "remote",
+      peer,
+      host,
+      port: peer.port,
+      scheme: peer.scheme === "https" ? "https" : "http",
+      secretMode: peer.matchedSecretMode ?? "",
+    };
   }
 
   async function callRemote(host, port, path, options = {}) {
@@ -920,8 +1004,9 @@ export function apply(ctx, config) {
     for (const item of primary.all ?? []) push(item);
 
     let lastError = null;
+    const timeoutMs = options.scheme === "https" ? config.tunnelTimeoutMs : config.requestTimeoutMs;
     for (const item of ordered) {
-      const url = `http://${host}:${port}${path}`;
+      const url = peerUrl(options.scheme, host, port, path);
       const response = await fetch(url, {
         method: options.method ?? "GET",
         headers: {
@@ -929,7 +1014,7 @@ export function apply(ctx, config) {
           ...(options.body ? { "content-type": "application/json" } : {}),
         },
         body: options.body ? JSON.stringify(options.body) : undefined,
-        signal: AbortSignal.timeout(config.requestTimeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (response.status === 401) {
         lastError = new Error("对端拒绝访问：两端共享密钥不一致。请确认两台机器登录同一个 DeepSeek 账号，或在两端配置里写同一个 secret。");
@@ -1150,12 +1235,22 @@ export function apply(ctx, config) {
       }
       const raw = typeof body?.entry === "string" ? body.entry.trim() : "";
       const parsed = parseTarget(raw);
-      if (!parsed) return send(res, 400, { ok: false, error: "地址格式不认识，写成 192.168.1.5 或 192.168.1.5:45940" });
+      if (!parsed) {
+        return send(res, 400, {
+          ok: false,
+          error: "地址格式不认识：写成 192.168.1.5、192.168.1.5:45940，或 https://xxx.cpolar.cn 这样的隧道域名",
+        });
+      }
       if (parsed.host === "127.0.0.1" || parsed.host === "localhost") {
         return send(res, 400, { ok: false, error: "127.0.0.1 就是本机，不用添加" });
       }
-      const entry = parsed.port === config.port ? parsed.host : `${parsed.host}:${parsed.port}`;
-      if (!state.extraPeers.includes(entry)) {
+      const entry = formatTarget(parsed, config.port);
+      // 同 host 只保留一条：用户可能先填 IP 后填隧道域名，指向同一台机器时不该堆两行
+      const already = state.extraPeers.some((item) => {
+        const itemParsed = parseTarget(item);
+        return (itemParsed ? itemParsed.host : item) === parsed.host;
+      });
+      if (!already) {
         state.extraPeers.push(entry);
         saveState();
       }
@@ -1174,9 +1269,17 @@ export function apply(ctx, config) {
         return send(res, 400, { ok: false, error: String(err?.message ?? err) });
       }
       const raw = typeof body?.entry === "string" ? body.entry.trim() : "";
-      const host = raw.replace(/^manual:/, "").split(":")[0];
+      // entry 可能是 "manual:host"、"host"、"host:port" 或 "https://host"，
+      // 统一解析出 host 再按 host 前缀匹配，避免带协议的地址删不掉。
+      const bare = raw.replace(/^manual:/, "");
+      const parsed = parseTarget(bare);
+      const host = parsed ? parsed.host : bare.split(":")[0];
       const before = state.extraPeers.length;
-      state.extraPeers = state.extraPeers.filter((item) => item !== raw && !item.startsWith(`${host}:`) && item !== host);
+      state.extraPeers = state.extraPeers.filter((item) => {
+        if (item === raw || item === bare || item === host) return false;
+        const itemParsed = parseTarget(item);
+        return (itemParsed ? itemParsed.host : item) !== host;
+      });
       if (state.extraPeers.length !== before) saveState();
       peerCache.at = 0;
       const overview = await refreshPeers(true);
@@ -1200,6 +1303,7 @@ export function apply(ctx, config) {
       }
       const value = await callRemote(resolved.host, resolved.port, `${PEER}/sessions`, {
         secretMode: resolved.secretMode,
+        scheme: resolved.scheme,
       });
       return send(res, 200, { ok: true, target: resolved.peer.key, machine: resolved.peer.machine, ...value });
     });
@@ -1220,7 +1324,7 @@ export function apply(ctx, config) {
         resolved.host,
         resolved.port,
         `${PEER}/transcript?sessionId=${encodeURIComponent(sessionId)}&afterSeq=${afterSeq}`,
-        { secretMode: resolved.secretMode },
+        { secretMode: resolved.secretMode, scheme: resolved.scheme },
       );
       return send(res, 200, { ...value, target: resolved.peer.key });
     });
@@ -1244,6 +1348,7 @@ export function apply(ctx, config) {
         method: "POST",
         body: { sessionId, text: body?.text, mode: body?.mode },
         secretMode: resolved.secretMode,
+        scheme: resolved.scheme,
       });
       return send(res, 200, { ...value, target: resolved.peer.key });
     });

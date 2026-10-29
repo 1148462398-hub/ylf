@@ -1,10 +1,10 @@
 dsh-plugin-fleet（编队）· 安装与连接指南
 ========================================
-版本 1.1.0　显示名「编队」　包名 dsh-plugin-fleet
+版本 1.2.0　显示名「编队」　包名 dsh-plugin-fleet
 （目录名仍然叫 dsh-fleet，不影响使用。）
 
 
-一、公司电脑装插件
+一、另一台电脑装插件
 ----------------
 1) 把家里电脑上这个文件夹整体拷到公司电脑（微信 / 网盘 / U 盘都行）：
    C:\Users\123\Documents\deepseek-harness\default-workspace\dsh-fleet
@@ -15,7 +15,7 @@ dsh-plugin-fleet（编队）· 安装与连接指南
 3) 对新会话说一句：
    「把 C:\Users\你的用户名\dsh-fleet 装成插件」
    它会调用 plugin_manager install_bundle，返回里应该有：
-       "bundle": "dsh-plugin-fleet", "version": "1.1.0", "application": "applied"
+       "bundle": "dsh-plugin-fleet", "version": "1.2.0", "application": "applied"
 
 4) 左侧栏出现「编队」图标（在 Mesh 下面），点开是三栏界面。
    没出现就 Ctrl+R 刷新一次页面。
@@ -26,14 +26,18 @@ dsh-plugin-fleet（编队）· 安装与连接指南
 
 二、两台机器配对（三种方式，可以同时生效）
 --------------------------------------
-【方式 1 · 同账号，零配置】← 最省事，推荐
+【方式 1 · 同账号，零配置】← 同局域网时最省事
    两台机器都登录同一个 DeepSeek 账号，密钥由账号 userId 自动派生，不用做任何事。
    机器列表里出现对方 = 已打通。
+
+   ★ 但账号派生只解决「密钥对得上」，不解决「找不到对方」。
+     两台机器不在同一个局域网（比如公司网 vs 家里宽带）时，
+     自动发现靠的组播出不了路由器，必须看下面第三节。
 
 【方式 2 · 面板复制密钥】
    家里这台：编队 → 「两端密钥」→ 点「随机生成」→ 复制这一串
    公司这台：编队 → 「两端密钥」→ 粘贴 → 点保存
-   两边显示的指纹数字一样就配对成功（家里这台当前 74bb2e9a）。
+   两边显示的指纹数字一样就配对成功。
 
 【方式 3 · 配置文件写死】
    两台机器的 cordis.patch.yml 里 config.secret 填同一个字符串（≥12 字符）。
@@ -42,13 +46,42 @@ dsh-plugin-fleet（编队）· 安装与连接指南
      （config / shared / account / account-legacy / local），逐条尝试，任意一条对上就算通。
      所以填过共享密钥以后，同账号那条通道照样能用。
 
-【机器怎么找到对方】
-   - 同一个局域网：装了 dsh-plugin-mesh 会自动发现，列表里直接出现。
-   - 不在同一网段 / 公司网禁组播：点「手工添加机器」填对方 IP，
-     写法 192.168.1.5 或 192.168.1.5:45940
+【同一个局域网时怎么找到对方】
+   装了 dsh-plugin-mesh 会自动发现，列表里直接出现。
+   没出现就点「手工添加机器」填对方 IP，写法 192.168.1.5 或 192.168.1.5:45940。
+   面板里「本机地址」那一行显示的就是该填到对方机器上的值。
 
 
-三、怎么用
+三、两台机器不在同一个网络（家里 ↔ 公司）★ 你遇到的正是这个
+------------------------------------------------------
+自动发现在这里必然失败，因为组播出不了路由器，跟插件代码无关。
+解决办法：把其中一台挂到公网隧道上，另一台主动连过去。
+
+【3.1 在「被访问」的那台机器上起隧道】
+   运行插件目录里的 start-tunnel.ps1：
+       powershell -ExecutionPolicy Bypass -File start-tunnel.ps1
+   它用 dsh-mobile 自带的 cpolar 把 45940 挂出去，最多等 30 秒，
+   拿到 https://xxxxxxxx.r19.vip.cpolar.cn 后会直接写进剪贴板。
+   已经在跑就只打印现有地址，不会重复起。
+
+   手动等价命令：
+     & "$env:USERPROFILE\.dsh\mobile-access\components\cpolar\3.3.18\cpolar.exe" `
+       http -config="$env:USERPROFILE\.dsh\mobile-access\state\cpolar\cpolar.yml" `
+       -inspect-addr=false -log=stdout -log-level=INFO 45940
+
+【3.2 在另一台机器上连】
+   编队 → 「手工添加机器」→ 粘贴完整域名：
+       https://xxxxxxxx.r19.vip.cpolar.cn
+   插件认得 http:// 和 https:// 前缀，https 没写端口按 443 处理。
+
+【3.3 密钥】
+   隧道是公网可达的，没有正确密钥一律 401。所以先把两端的共享密钥设成同一串，再开隧道。
+
+   ★ 隧道地址是临时的：cpolar 免费版重启会换域名。
+     换了就把新域名重新填一次，旧的在列表里删掉。
+
+
+四、怎么用
 --------
 选机器 → 中间列出它所有任务，已自动分组：
    ▾ 工作区任务（默认展开）
@@ -60,26 +93,33 @@ dsh-plugin-fleet（编队）· 安装与连接指南
 → 底部输入框直接发消息，对方会接着原来的上下文继续干。
 
 
-四、注意
+五、注意
 --------
-- 端口 45940 别被防火墙挡；跨公网先用 Tailscale 或 cpolar 打通，再填 tailnet IP。
+- 端口 45940 别被防火墙挡。本机防火墙服务 mpssvc 目前是坏的（StopPending），
+  netsh advfirewall 用不了，所以放行规则这条路走不通，直接走隧道更省事。
 - 密钥等于门钥匙，别发群里；泄露了就在面板里重新生成一次。
-- 换过 DeepSeek 账号（userId 变了）后，账号派生那把钥匙会跟着变，需要重新登录同账号或改用共享密钥。
+- 换过 DeepSeek 账号（userId 变了）后，账号派生那把钥匙会跟着变。
 - 只读投影 + 发消息：不转发审批、不打断、不换模型。
 - 超长历史只回最近 400 条（truncated=true 时前端保留尾部）。
+- 隧道下第一次拉会话列表要十几秒，属正常（内部超时已放到 60 秒）。
 - 自测（不需要两台机器）：
     node _selftest-client.mjs        浏览器 bundle：插槽注册 + 首屏渲染 + 四个分组
     node _selftest-remote.mjs        起假对端，验证投影和远程发消息
-    node _selftest-crosssecret.mjs   专门验证「填过共享密钥后同账号通道仍然可用」
+    node _selftest-crosssecret.mjs   验证「填过共享密钥后同账号通道仍然可用」
+    node _selftest-tunnel.mjs https://xxx.cpolar.cn   验证隧道地址能不能打通
 
 
-五、装不上怎么查
---------------
+六、装不上 / 连不上怎么查
+--------------------
 1) GET <你的DSH地址>/fleet/api/debug
-   看 version / secrets（四条指纹）/ account.userId / services 是否都在
+   看 version / secrets（几条指纹）/ account.userId / services 是否都在
 2) GET <你的DSH地址>/fleet/api/overview
-   看 port / secret.mode / mesh 状态 / peers
-3) GET http://<对端IP>:45940/fleet/v1/hello  带 Authorization: Bearer <密钥>
+   看 port / secret.mode / mesh 状态 / peers（每台机器的 reachable 和 note）
+3) 直连对端：
+   GET http://<对端IP>:45940/fleet/v1/hello     带 Authorization: Bearer <密钥>
    200 = 对端端口正常；401 = 密钥对不上；连不上 = 防火墙或地址错
+4) 隧道对端：
+   GET https://xxx.cpolar.cn/fleet/v1/hello     同样带 Bearer
+   401 说明隧道通了但密钥不对；超时说明隧道没起或域名过期
 
    把报错发我就行。

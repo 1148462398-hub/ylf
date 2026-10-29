@@ -553,6 +553,10 @@ window.__ModuleLoader__.load({
       const accountInfo = (overview && overview.account) || null;
       const meshInfo = (overview && overview.mesh) || null;
       const manualPeers = (overview && overview.extraPeers) || [];
+      // 本机可被对端填写的地址（跨机配对时直接照抄这一行）
+      const selfAddresses = (overview && overview.self && overview.self.addresses) || [];
+      const selfPort = (overview && overview.self && overview.self.port) || 45940;
+      const selfAddressText = selfAddresses.length ? `${selfAddresses[0].address}:${selfPort}` : "";
       const selectedSession = sessions.find((session) => session.sessionId === sessionId) || null;
 
       // 按组切分会话；组内保持 Host 给的 updatedAt 降序
@@ -659,7 +663,7 @@ window.__ModuleLoader__.load({
                 { className: "fleet-pair-row" },
                 h("input", {
                   className: "fleet-input is-compact",
-                  placeholder: "另一台机器的 IP 或 IP:45940",
+                  placeholder: "对方 IP、IP:45940 或 https://xxx.cpolar.cn",
                   value: peerDraft,
                   disabled: peerBusy,
                   onInput: (event) => setPeerDraft(event.target.value),
@@ -695,7 +699,19 @@ window.__ModuleLoader__.load({
                 : null,
               peerNotice
                 ? h("div", { className: "fleet-pair-hint" }, peerNotice)
-                : h("div", { className: "fleet-pair-hint" }, "局域网自动发现靠 dsh-plugin-mesh；它被挡或跨公网时，填对方 IP 也能连。"),
+                : h(
+                    "div",
+                    { className: "fleet-pair-hint" },
+                    "局域网自动发现靠 dsh-plugin-mesh；它被挡或跨公网时，填对方 IP 或隧道域名也能连。",
+                  ),
+              selfAddressText
+                ? h(
+                    "div",
+                    { className: "fleet-pair-hint" },
+                    "本机地址（填到另一台的输入框里）：",
+                    h("code", { className: "fleet-secret" }, selfAddressText),
+                  )
+                : null,
             ),
             h(
               "div",

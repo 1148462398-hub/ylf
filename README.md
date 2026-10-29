@@ -57,9 +57,57 @@ plugin_manager(action="install_bundle", target="dsh-plugin-fleet")
 | --- | --- |
 | 同一局域网 | mesh 组播自动发现，什么都不用配 |
 | 组播被路由器挡住 | 面板「手工添加机器」填 `192.168.1.5`（端口默认 45940） |
-| 跨公网 | 用 Tailscale / cpolar 之类打通二层，再填对方的 tailnet IP；或把 45940 端口映射出去（**必须**先设好共享密钥） |
+| 跨公网（推荐） | 一端把 45940 挂到 HTTPS 隧道上，另一端把隧道域名填进「手工添加机器」，见下 |
+| 跨公网（自建） | Tailscale 之类打通二层后填 tailnet IP，或把 45940 映射到公网（**必须**先设好共享密钥） |
 
 对端端口固定是 `config.port`（默认 **45940**），只服务 `/fleet/v1/*`；UI 接口 `/fleet/api/*` 挂在 DSH 自己的 web 端口上，浏览器同源访问，不额外开端口。
+
+### 跨公网：用 HTTPS 隧道（不用改路由器，不用公网 IP）
+
+两端不在同一个网络时（比如家里 ↔ 公司），局域网发现必然失效——它靠的是组播，
+出不了路由器。这时只要**把一端暴露到公网**，另一端就能主动连过去。
+
+### 一键起隧道
+
+被访问的那台机器上，运行 `start-tunnel.ps1`（或
+`powershell -ExecutionPolicy Bypass -File start-tunnel.ps1`）：
+
+- 检测到已经在跑就只打印现有地址，不会重复起（cpolar 同 token 多开会互相顶掉）；
+- 否则用 dsh-mobile 自带的 cpolar 把 45940 挂出去，最多等 30 秒；
+- 拿到 `https://xxxxxxxx.r19.vip.cpolar.cn` 后**直接写进剪贴板**。
+
+脚本等价于这条命令：
+
+```powershell
+& "$env:USERPROFILE\.dsh\mobile-access\components\cpolar\3.3.18\cpolar.exe" `
+  http -config="$env:USERPROFILE\.dsh\mobile-access\state\cpolar\cpolar.yml" `
+  -inspect-addr=false -log=stdout -log-level=INFO 45940
+```
+
+### 在另一台机器上连
+
+面板「手工添加机器」里直接粘贴完整域名：
+
+```
+https://xxxxxxxx.r19.vip.cpolar.cn
+```
+
+插件认得 `http://` / `https://` 前缀：https 且没写端口时按 443 处理，
+拼 URL 时不会再补一个 `:443`；隧道请求单独用更宽的超时
+（`config.tunnelTimeoutMs`，默认 60 秒，因为跨公网拉一次会话列表要十几秒）。
+
+### 密钥
+
+隧道是公网可达的，**没有正确密钥一律 401**，所以务必先在面板里设好共享密钥，再开隧道。
+两端密钥不一致时，`/fleet/api/debug` 会把两边的指纹并排列出来，照着核对即可。
+
+> 隧道只暴露 `/fleet/v1/*` 这一个接口，全部走 Bearer 校验；
+> 但毕竟是公网入口，建议随手换一次密钥，不要长期沿用同一个。
+>
+> 面板里「本机地址」那一行显示本机的局域网 IP:端口，方便反过来填到对方机器上。
+>
+> **隧道地址是临时的**：cpolar 免费版重启后会换域名。换了就把新域名重新填一次，
+> 旧的删掉即可。
 
 ## 接口（给排查用）
 
@@ -112,6 +160,22 @@ node _selftest-crosssecret.mjs   # 同账号零配置：假对端只认账号派
 - 只有文本进投影：图片 / 附件只显示占位，不能点开。
 
 ## 更新日志
+
+### 1.2.0
+
+- **跨公网可用了：支持 HTTPS 隧道地址。** 「手工添加机器」现在接受完整 URL
+  （`https://xxxxxxxx.cpolar.cn`），解析出 `scheme` 后一路带到探活与后续请求；
+  https 且端口缺省按 443 处理，拼 URL 时不再补 `:443`。
+- 隧道请求单独用 `config.tunnelTimeoutMs`（默认 **60000** ms）：
+  跨公网拉一次会话列表要十几秒，用局域网那档 12 秒必然超时。
+- `config.requestTimeoutMs` 默认从 12000 提到 20000。
+- **修复标题全空**：几百条会话时 `readTitleSnapshots` 一次读全部会超时，
+  失败后所有标题都是空串。改为分批（每批 60）+ `titleCache` 缓存已读到的标题，
+  单批超时只影响这一批。实测 460 条会话拿到 438 个标题。
+- `/overview` 的 `self.addresses` 返回本机所有非回环 IPv4（169.254 排最后），
+  面板「本机地址」直接显示 `IP:端口`，方便填到对方机器上。
+- 修 `peers/remove` 删不掉带协议前缀的地址（之前按 `:` 切分会把 `https://x` 切坏）。
+- 同名 host 只保留一条手工地址，避免 IP 和隧道域名重复堆叠。
 
 ### 1.1.0
 

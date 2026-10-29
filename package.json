@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-fleet",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "Fleet: watch and drive DSH sessions running on your other machines. Lists remote sessions with live run state, projects their transcripts into this GUI, and lets you send follow-up prompts into them - paired by a shared key over LAN, mesh, or a tunnel.",
   "license": "MIT",
